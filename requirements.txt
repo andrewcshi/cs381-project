@@ -1,4 +1,6 @@
-pybullet
 torch
 numpy
 scipy
+matplotlib
+numpy
+ipython
