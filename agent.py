@@ -1,3 +1,5 @@
+# agent.py
+
 import numpy as np
 from numpy.linalg import norm
 
@@ -69,19 +71,102 @@ class Agent:
         return self.gx, self.gy
 
 class Obstacle(Agent):
-    """Static obstacle agent that doesn't move."""
+    """Dynamic obstacle agent that can move based on different movement patterns."""
     
-    def __init__(self, time_step):
+    def __init__(self, time_step, velocity_scale=0.3):
         super().__init__()
         self.visible = True
         # Random radius for variety - between 0.2 and 0.8
         self.radius = 0.2 + np.random.random() * 0.6
         self.time_step = time_step
-        self.v_pref = 0  # Obstacles don't move
+        
+        # Velocity parameters - now obstacles can move
+        self.v_pref = velocity_scale * (0.3 + np.random.random() * 0.4)  # Random speed between 0.3-0.7 × scale
+        
+        # Movement pattern parameters
+        self.movement_type = np.random.choice(['linear', 'circular', 'random'])
+        self.movement_timer = 0
+        self.movement_period = 10.0  # Time before changing direction for random movement
+        self.direction_angle = np.random.random() * 2 * np.pi  # Initial direction
+        
+        # For circular movement
+        self.center_x = 0
+        self.center_y = 0
+        self.orbit_radius = 0
+        self.angular_velocity = 0
+        self.angle = 0
+    
+    def set_circular_params(self, center_x, center_y):
+        """Setup parameters for circular movement."""
+        self.movement_type = 'circular'
+        self.center_x = center_x
+        self.center_y = center_y
+        # Calculate orbit radius based on current position
+        dx = self.px - center_x
+        dy = self.py - center_y
+        self.orbit_radius = np.sqrt(dx*dx + dy*dy)
+        # Set initial angle
+        self.angle = np.arctan2(dy, dx)
+        # Random angular velocity (radians per time step)
+        self.angular_velocity = (0.02 + np.random.random() * 0.03) * (1 if np.random.random() > 0.5 else -1)
+    
+    def calculate_velocity(self):
+        """Calculate velocity based on movement pattern."""
+        if self.movement_type == 'linear':
+            # Linear movement with occasional bouncing off boundaries
+            vx = self.v_pref * np.cos(self.direction_angle)
+            vy = self.v_pref * np.sin(self.direction_angle)
+            
+            # Boundary check (simple bounce)
+            boundary = 5.0  # Boundary of the environment
+            if abs(self.px + vx * self.time_step) > boundary or abs(self.py + vy * self.time_step) > boundary:
+                # Reflect direction when hitting boundary
+                self.direction_angle = np.random.random() * 2 * np.pi
+                vx = self.v_pref * np.cos(self.direction_angle)
+                vy = self.v_pref * np.sin(self.direction_angle)
+                
+        elif self.movement_type == 'circular':
+            # Circular movement around a center point
+            self.angle += self.angular_velocity
+            # Calculate position on the circle
+            target_x = self.center_x + self.orbit_radius * np.cos(self.angle)
+            target_y = self.center_y + self.orbit_radius * np.sin(self.angle)
+            # Calculate velocity to move toward the target position
+            dx = target_x - self.px
+            dy = target_y - self.py
+            dist = np.sqrt(dx*dx + dy*dy)
+            
+            if dist > 0.001:  # Avoid division by zero
+                vx = dx / dist * self.v_pref
+                vy = dy / dist * self.v_pref
+            else:
+                vx, vy = 0, 0
+                
+        elif self.movement_type == 'random':
+            # Random directional changes
+            self.movement_timer += self.time_step
+            if self.movement_timer >= self.movement_period:
+                self.movement_timer = 0
+                self.direction_angle = np.random.random() * 2 * np.pi
+                
+            vx = self.v_pref * np.cos(self.direction_angle)
+            vy = self.v_pref * np.sin(self.direction_angle)
+        
+        return vx, vy
     
     def step(self, action=None):
-        """Obstacles don't move, so override step to do nothing."""
-        pass
+        """Update obstacle position based on its velocity."""
+        vx, vy = self.calculate_velocity()
+        
+        # Update position and velocity
+        self.px += vx * self.time_step
+        self.py += vy * self.time_step
+        self.vx = vx
+        self.vy = vy
+        
+        # Update orientation based on movement direction
+        if vx != 0 or vy != 0:
+            self.theta = np.arctan2(vy, vx)
 
 class Robot(Agent):
     """Robot agent controlled by the learning algorithm."""
