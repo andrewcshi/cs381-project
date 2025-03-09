@@ -1,3 +1,5 @@
+# config.py
+
 # Training hyperparams
 TRAINING = {
     'lr': 0.0001,                    # Learning rate
@@ -45,6 +47,14 @@ ENVIRONMENT = {
     'obstacle_num': 5,               # Default number of obstacles
     'layout': 'circle',              # Default obstacle layout
     'time_out_duration': 25.0,       # Maximum episode duration in seconds
+    'moving_obstacle_ratio': 0.8,    # Ratio of obstacles that move (NEW)
+    'obstacle_velocity_scale': 0.3,  # Velocity scale factor for obstacles (NEW)
+    'curriculum_learning': True,     # Whether to use curriculum learning (NEW)
+    'curriculum_phases': [           # Phases for curriculum learning (NEW)
+        {'moving_ratio': 0.2, 'velocity_scale': 0.2, 'episodes': 100},  # Phase 1: Few slow-moving obstacles
+        {'moving_ratio': 0.5, 'velocity_scale': 0.3, 'episodes': 200},  # Phase 2: Half obstacles moving at medium speed
+        {'moving_ratio': 0.8, 'velocity_scale': 0.4, 'episodes': 200},  # Phase 3: Most obstacles moving at higher speed
+    ],
 }
 
 # Paths for saving models and figures

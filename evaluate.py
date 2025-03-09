@@ -1,3 +1,5 @@
+# evaluate.py
+
 import os
 import torch
 import numpy as np
@@ -6,6 +8,8 @@ import argparse
 from env import ObstacleEnv
 from models import LSTMNetwork, TransformerNetwork
 from config import MODEL, ENVIRONMENT, PATHS
+
+# Update the Evaluator class in evaluate.py
 
 class Evaluator:
     def __init__(self, model_path, model_type, episode):
@@ -61,7 +65,9 @@ class Evaluator:
     
     def run_evaluation(self, num_episodes=100, render_every=25, 
                      obstacle_num=ENVIRONMENT['obstacle_num'], 
-                     layout=ENVIRONMENT['layout']):
+                     layout=ENVIRONMENT['layout'],
+                     moving_obstacle_ratio=ENVIRONMENT.get('moving_obstacle_ratio', 0.8),
+                     obstacle_velocity_scale=ENVIRONMENT.get('obstacle_velocity_scale', 0.3)):
         """
         Run evaluation episodes.
         
@@ -70,6 +76,8 @@ class Evaluator:
             render_every: Render environment every N episodes (0 to disable)
             obstacle_num: Number of obstacles
             layout: Obstacle layout
+            moving_obstacle_ratio: Ratio of obstacles that move
+            obstacle_velocity_scale: Velocity scale factor for obstacles
             
         Returns:
             Dictionary of evaluation metrics
@@ -80,12 +88,32 @@ class Evaluator:
         rewards = []
         path_lengths = []
         
+        # For tracking performance with different obstacle mobility settings
+        static_results = {'success': 0, 'collision': 0, 'timeout': 0, 'episodes': 0}
+        moving_results = {'success': 0, 'collision': 0, 'timeout': 0, 'episodes': 0}
+        
         for episode in range(num_episodes):
             # Reset environment
-            obs = self.env.reset(obstacle_num=obstacle_num, layout=layout, 
-                               test_phase=True, counter=episode)
+            obs = self.env.reset(
+                obstacle_num=obstacle_num, 
+                layout=layout, 
+                test_phase=True, 
+                counter=episode,
+                moving_obstacle_ratio=moving_obstacle_ratio,
+                obstacle_velocity_scale=obstacle_velocity_scale
+            )
             state = self.env.convert_coord(obs)
             
+            # Count the number of moving obstacles in this episode
+            num_moving_obstacles = sum(1 for obs in self.env.obstacle_list if obs.v_pref > 0)
+            
+            # Track whether this episode has moving obstacles
+            has_moving_obstacles = num_moving_obstacles > 0
+            if has_moving_obstacles:
+                moving_results['episodes'] += 1
+            else:
+                static_results['episodes'] += 1
+                
             done = False
             episode_reward = 0
             steps = 0
@@ -116,21 +144,41 @@ class Evaluator:
             # Update metrics based on episode outcome
             if info == "collision":
                 collision_rate += 1
+                if has_moving_obstacles:
+                    moving_results['collision'] += 1
+                else:
+                    static_results['collision'] += 1
             elif info == "timeout":
                 timeout_rate += 1
+                if has_moving_obstacles:
+                    moving_results['timeout'] += 1
+                else:
+                    static_results['timeout'] += 1
             else:  # Goal reached
                 success_rate += 1
                 path_lengths.append(steps)
+                if has_moving_obstacles:
+                    moving_results['success'] += 1
+                else:
+                    static_results['success'] += 1
             
             rewards.append(episode_reward)
             
             if episode % 10 == 0:
-                print(f"Completed episode {episode}/{num_episodes}, reward: {episode_reward:.2f}, outcome: {info}")
+                print(f"Completed episode {episode}/{num_episodes}, reward: {episode_reward:.2f}, " +
+                     f"outcome: {info}, moving obstacles: {num_moving_obstacles}/{obstacle_num}")
         
         # Normalize rates
         success_rate /= num_episodes
         collision_rate /= num_episodes
         timeout_rate /= num_episodes
+        
+        # Calculate rates for static and moving obstacle scenarios
+        static_success_rate = static_results['success'] / max(static_results['episodes'], 1)
+        static_collision_rate = static_results['collision'] / max(static_results['episodes'], 1)
+        
+        moving_success_rate = moving_results['success'] / max(moving_results['episodes'], 1)
+        moving_collision_rate = moving_results['collision'] / max(moving_results['episodes'], 1)
         
         # Compute average path length for successful episodes
         avg_path_length = np.mean(path_lengths) if path_lengths else 0
@@ -142,7 +190,13 @@ class Evaluator:
             "collision_rate": collision_rate,
             "timeout_rate": timeout_rate,
             "avg_reward": np.mean(rewards),
-            "avg_path_length": avg_path_length
+            "avg_path_length": avg_path_length,
+            "static_success_rate": static_success_rate,
+            "static_collision_rate": static_collision_rate,
+            "moving_success_rate": moving_success_rate,
+            "moving_collision_rate": moving_collision_rate,
+            "static_episodes": static_results['episodes'],
+            "moving_episodes": moving_results['episodes']
         }
         
         return results
@@ -150,7 +204,7 @@ class Evaluator:
     def plot_results(self, results):
         """Plot evaluation results with improved styling."""
         plt.style.use('ggplot')
-        plt.figure(figsize=(12, 8))
+        plt.figure(figsize=(14, 10))
         
         # Success, collision, timeout rates
         plt.subplot(221)
@@ -160,7 +214,7 @@ class Evaluator:
         
         bars = plt.bar(labels, rates, color=colors, alpha=0.8)
         plt.ylim(0, 1)
-        plt.title(f"{self.model_type.upper()} Performance Rates", fontsize=14, fontweight='bold')
+        plt.title(f"{self.model_type.upper()} Overall Performance", fontsize=14, fontweight='bold')
         plt.ylabel("Rate", fontsize=12)
         
         # Add percentage labels on top of bars
@@ -169,8 +223,42 @@ class Evaluator:
             plt.text(bar.get_x() + bar.get_width()/2., height + 0.02,
                     f'{height:.1%}', ha='center', va='bottom', fontweight='bold')
         
-        # Add text with numerical results
+        # Static vs Moving obstacles comparison
         plt.subplot(222)
+        
+        # Calculate static and moving rates
+        static_rates = [results["static_success_rate"], results["static_collision_rate"]]
+        moving_rates = [results["moving_success_rate"], results["moving_collision_rate"]]
+        
+        x = np.arange(2)
+        width = 0.35
+        
+        ax = plt.gca()
+        rects1 = ax.bar(x - width/2, static_rates, width, label='Static Obstacles', color='#1f77b4')
+        rects2 = ax.bar(x + width/2, moving_rates, width, label='Moving Obstacles', color='#ff7f0e')
+        
+        ax.set_ylim(0, 1)
+        ax.set_ylabel('Rate')
+        ax.set_title('Static vs. Moving Obstacle Performance', fontsize=14, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(['Success', 'Collision'])
+        ax.legend()
+        
+        # Add percentage labels
+        def add_percentage_labels(rects):
+            for rect in rects:
+                height = rect.get_height()
+                ax.annotate(f'{height:.1%}',
+                          xy=(rect.get_x() + rect.get_width() / 2, height),
+                          xytext=(0, 3),  # 3 points vertical offset
+                          textcoords="offset points",
+                          ha='center', va='bottom', fontweight='bold')
+        
+        add_percentage_labels(rects1)
+        add_percentage_labels(rects2)
+        
+        # Add text with numerical results
+        plt.subplot(223)
         plt.axis('off')
         result_text = "\n".join([
             f"Model: {self.model_type.upper()}",
@@ -178,25 +266,31 @@ class Evaluator:
             f"Collision Rate: {results['collision_rate']:.2%}",
             f"Timeout Rate: {results['timeout_rate']:.2%}",
             f"Average Reward: {results['avg_reward']:.2f}",
-            f"Average Path Length: {results['avg_path_length']:.2f} steps"
+            f"Average Path Length: {results['avg_path_length']:.2f} steps",
+            f"\nStatic Obstacles ({results['static_episodes']} episodes):",
+            f"  Success Rate: {results['static_success_rate']:.2%}",
+            f"  Collision Rate: {results['static_collision_rate']:.2%}",
+            f"\nMoving Obstacles ({results['moving_episodes']} episodes):",
+            f"  Success Rate: {results['moving_success_rate']:.2%}",
+            f"  Collision Rate: {results['moving_collision_rate']:.2%}"
         ])
         plt.text(0.1, 0.5, result_text, fontsize=12, 
                 bbox=dict(boxstyle="round,pad=0.5", fc='white', alpha=0.8))
         
         # Add a radar chart for visual comparison of metrics
-        plt.subplot(212)
+        plt.subplot(224, polar=True)
         
         # Create normalized metrics for radar chart
-        metrics = ['Success Rate', 'Safety\n(1-Collision)', 'Efficiency\n(Reward)', 'Path\nOptimality']
+        metrics = ['Overall\nSuccess', 'Static\nSuccess', 'Moving\nSuccess', 'Safety\n(1-Collision)', 'Efficiency\n(Reward)']
         
         # Normalize metrics to 0-1 scale (where 1 is always better)
         values = [
             results['success_rate'],
+            results['static_success_rate'],
+            results['moving_success_rate'],
             1 - results['collision_rate'],  # Invert collision rate so higher is better
             # Normalize reward to 0-1 scale (approximation)
-            min(max(results['avg_reward'] / 10, 0), 1) if results['avg_reward'] > 0 else 0,
-            # Path optimality - shorter paths are better (if we have successful episodes)
-            0.8 / max(results['avg_path_length'] / 20, 0.1) if results['avg_path_length'] > 0 else 0
+            min(max(results['avg_reward'] / 10, 0), 1) if results['avg_reward'] > 0 else 0
         ]
         
         # Add first value again to close the polygon
@@ -208,7 +302,7 @@ class Evaluator:
         angles = np.concatenate((angles, [angles[0]]))
         
         # Draw the radar chart
-        ax = plt.subplot(212, polar=True)
+        ax = plt.subplot(224, polar=True)
         ax.fill(angles, values, color='#1f77b4', alpha=0.25)
         ax.plot(angles, values, 'o-', linewidth=2, color='#1f77b4')
         
@@ -226,32 +320,32 @@ class Evaluator:
         plt.tight_layout()
         plt.savefig(f"{PATHS['eval_path']}/{self.model_type}_eval_results.png", dpi=150)
         plt.close()
-        plt.close()
 
 def compare_models(lstm_results, transformer_results):
     """Compare and visualize results from both models."""
     # Create bar chart comparing key metrics
-    metrics = ["success_rate", "collision_rate", "avg_reward", "avg_path_length"]
-    labels = ["Success Rate", "Collision Rate", "Avg Reward", "Avg Path Length"]
+    metrics = ["success_rate", "collision_rate", "static_success_rate", "moving_success_rate", "avg_reward"]
+    labels = ["Overall Success", "Collision Rate", "Static Success", "Moving Success", "Avg Reward"]
     
-    plt.figure(figsize=(14, 10))
+    plt.figure(figsize=(15, 10))
     
-    # Normalize path length and reward for better visualization
+    # Normalize reward for better visualization
     max_reward = max(lstm_results["avg_reward"], transformer_results["avg_reward"])
-    max_path = max(lstm_results["avg_path_length"], transformer_results["avg_path_length"])
     
     lstm_values = [
         lstm_results["success_rate"],
         lstm_results["collision_rate"],
-        lstm_results["avg_reward"] / max_reward if max_reward != 0 else 0,
-        lstm_results["avg_path_length"] / max_path if max_path != 0 else 0
+        lstm_results["static_success_rate"],
+        lstm_results["moving_success_rate"],
+        lstm_results["avg_reward"] / max_reward if max_reward != 0 else 0
     ]
     
     transformer_values = [
         transformer_results["success_rate"],
         transformer_results["collision_rate"],
-        transformer_results["avg_reward"] / max_reward if max_reward != 0 else 0,
-        transformer_results["avg_path_length"] / max_path if max_path != 0 else 0
+        transformer_results["static_success_rate"],
+        transformer_results["moving_success_rate"],
+        transformer_results["avg_reward"] / max_reward if max_reward != 0 else 0
     ]
     
     x = np.arange(len(labels))
@@ -261,7 +355,7 @@ def compare_models(lstm_results, transformer_results):
     plt.bar(x + width/2, transformer_values, width, label='Transformer')
     
     plt.xlabel('Metrics')
-    plt.title('LSTM vs Transformer Performance Comparison')
+    plt.title('LSTM vs Transformer Performance Comparison (Static & Moving Obstacles)', fontsize=14, fontweight='bold')
     plt.xticks(x, labels)
     plt.legend()
     
@@ -269,50 +363,122 @@ def compare_models(lstm_results, transformer_results):
     for i, v in enumerate(lstm_values):
         if metrics[i] == "avg_reward":
             plt.text(i - width/2, v + 0.02, f"{lstm_results['avg_reward']:.2f}", ha='center')
-        elif metrics[i] == "avg_path_length":
-            plt.text(i - width/2, v + 0.02, f"{lstm_results['avg_path_length']:.2f}", ha='center')
         else:
             plt.text(i - width/2, v + 0.02, f"{v:.2f}", ha='center')
     
     for i, v in enumerate(transformer_values):
         if metrics[i] == "avg_reward":
             plt.text(i + width/2, v + 0.02, f"{transformer_results['avg_reward']:.2f}", ha='center')
-        elif metrics[i] == "avg_path_length":
-            plt.text(i + width/2, v + 0.02, f"{transformer_results['avg_path_length']:.2f}", ha='center')
         else:
             plt.text(i + width/2, v + 0.02, f"{v:.2f}", ha='center')
     
     plt.tight_layout()
     plt.savefig(f"{PATHS['eval_path']}/model_comparison.png")
     
+    # Additional comparison chart for static vs moving obstacles
+    plt.figure(figsize=(12, 6))
+    
+    # Create grouped bar chart
+    labels = ['Static Success', 'Moving Success', 'Static Collision', 'Moving Collision']
+    lstm_values = [
+        lstm_results['static_success_rate'],
+        lstm_results['moving_success_rate'],
+        lstm_results['static_collision_rate'],
+        lstm_results['moving_collision_rate']
+    ]
+    
+    transformer_values = [
+        transformer_results['static_success_rate'],
+        transformer_results['moving_success_rate'],
+        transformer_results['static_collision_rate'],
+        transformer_results['moving_collision_rate']
+    ]
+    
+    x = np.arange(len(labels))
+    width = 0.35
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    rects1 = ax.bar(x - width/2, lstm_values, width, label='LSTM')
+    rects2 = ax.bar(x + width/2, transformer_values, width, label='Transformer')
+    
+    ax.set_ylim(0, 1)
+    ax.set_ylabel('Rate')
+    ax.set_title('Static vs Moving Obstacle Performance Comparison', fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.legend()
+    
+    # Add value labels
+    for i, v in enumerate(lstm_values):
+        ax.text(i - width/2, v + 0.02, f"{v:.2f}", ha='center')
+    
+    for i, v in enumerate(transformer_values):
+        ax.text(i + width/2, v + 0.02, f"{v:.2f}", ha='center')
+    
+    plt.tight_layout()
+    plt.savefig(f"{PATHS['eval_path']}/static_vs_moving_comparison.png")
+    
     # Print comparison results
     print("\nModel Comparison:")
     print("-" * 50)
-    print(f"LSTM Success Rate: {lstm_results['success_rate']:.2%}")
-    print(f"Transformer Success Rate: {transformer_results['success_rate']:.2%}")
+    print(f"LSTM Overall Success Rate: {lstm_results['success_rate']:.2%}")
+    print(f"Transformer Overall Success Rate: {transformer_results['success_rate']:.2%}")
+    print()
+    print(f"LSTM Static Success Rate: {lstm_results['static_success_rate']:.2%}")
+    print(f"Transformer Static Success Rate: {transformer_results['static_success_rate']:.2%}")
+    print()
+    print(f"LSTM Moving Success Rate: {lstm_results['moving_success_rate']:.2%}")
+    print(f"Transformer Moving Success Rate: {transformer_results['moving_success_rate']:.2%}")
     print()
     print(f"LSTM Collision Rate: {lstm_results['collision_rate']:.2%}")
     print(f"Transformer Collision Rate: {transformer_results['collision_rate']:.2%}")
     print()
     print(f"LSTM Average Reward: {lstm_results['avg_reward']:.2f}")
     print(f"Transformer Average Reward: {transformer_results['avg_reward']:.2f}")
-    print()
-    print(f"LSTM Average Path Length: {lstm_results['avg_path_length']:.2f}")
-    print(f"Transformer Average Path Length: {transformer_results['avg_path_length']:.2f}")
     print("-" * 50)
     
-    # Determine winner
+    # Determine overall winner
     lstm_score = lstm_results["success_rate"] - lstm_results["collision_rate"] + lstm_results["avg_reward"] / max_reward
     transformer_score = transformer_results["success_rate"] - transformer_results["collision_rate"] + transformer_results["avg_reward"] / max_reward
     
+    # Determine static scenario winner
+    lstm_static_score = lstm_results["static_success_rate"] - lstm_results["static_collision_rate"]
+    transformer_static_score = transformer_results["static_success_rate"] - transformer_results["static_collision_rate"]
+    
+    # Determine moving scenario winner
+    lstm_moving_score = lstm_results["moving_success_rate"] - lstm_results["moving_collision_rate"]
+    transformer_moving_score = transformer_results["moving_success_rate"] - transformer_results["moving_collision_rate"]
+    
+    print("\nPerformance Analysis:")
+    print("-" * 50)
+    
+    # Overall comparison
     if lstm_score > transformer_score:
         diff = (lstm_score - transformer_score) / transformer_score * 100 if transformer_score != 0 else float('inf')
-        print(f"LSTM outperforms Transformer by approximately {diff:.2f}%")
+        print(f"LSTM outperforms Transformer overall by approximately {diff:.2f}%")
     elif transformer_score > lstm_score:
         diff = (transformer_score - lstm_score) / lstm_score * 100 if lstm_score != 0 else float('inf')
-        print(f"Transformer outperforms LSTM by approximately {diff:.2f}%")
+        print(f"Transformer outperforms LSTM overall by approximately {diff:.2f}%")
     else:
-        print("Both models perform similarly")
+        print("Both models perform similarly overall")
+    
+    # Static scenario comparison
+    if lstm_static_score > transformer_static_score:
+        print(f"LSTM performs better with static obstacles")
+    elif transformer_static_score > lstm_static_score:
+        print(f"Transformer performs better with static obstacles")
+    else:
+        print("Both models perform similarly with static obstacles")
+    
+    # Moving scenario comparison
+    if lstm_moving_score > transformer_moving_score:
+        print(f"LSTM performs better with moving obstacles")
+    elif transformer_moving_score > lstm_moving_score:
+        print(f"Transformer performs better with moving obstacles")
+    else:
+        print("Both models perform similarly with moving obstacles")
+    
+    print("-" * 50)
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate trained models')

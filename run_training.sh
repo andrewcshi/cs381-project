@@ -1,3 +1,5 @@
+# run_training.sh
+
 #!/bin/bash
 # Full training script for obstacle avoidance with both LSTM and Transformer models
 

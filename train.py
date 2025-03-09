@@ -1,3 +1,5 @@
+# train.py
+
 import numpy as np
 from collections import deque
 import random
@@ -318,7 +320,7 @@ class DQN:
         return loss
 
     def train(self, num_episodes=None):
-        """Main training loop."""
+        """Main training loop with curriculum learning for moving obstacles."""
         if num_episodes is None:
             num_episodes = TRAINING['num_episodes']
             
@@ -335,22 +337,59 @@ class DQN:
         timeout_count = 0
         episode_steps_list = []
         
+        # Set up curriculum learning if enabled
+        use_curriculum = ENVIRONMENT.get('curriculum_learning', False)
+        curriculum_phases = ENVIRONMENT.get('curriculum_phases', [])
+        current_phase = 0
+        phase_episode_count = 0
+        moving_ratio = ENVIRONMENT.get('moving_obstacle_ratio', 0.8)
+        velocity_scale = ENVIRONMENT.get('obstacle_velocity_scale', 0.3)
+        
         # Start time for tracking training duration
         start_time = time.time()
         self.logger.info(f"Starting training for {num_episodes} episodes")
         
+        if use_curriculum and curriculum_phases:
+            self.logger.info("Using curriculum learning for moving obstacles:")
+            for i, phase in enumerate(curriculum_phases):
+                self.logger.info(f"  Phase {i+1}: Moving ratio {phase['moving_ratio']}, " +
+                            f"Velocity scale {phase['velocity_scale']}, " +
+                            f"Episodes {phase['episodes']}")
+            
+            # Initialize with first phase settings
+            moving_ratio = curriculum_phases[0]['moving_ratio']
+            velocity_scale = curriculum_phases[0]['velocity_scale']
+            self.logger.info(f"Starting with Phase 1: Moving ratio {moving_ratio}, Velocity scale {velocity_scale}")
+        
         # Print initial progress bar
         print_progress_bar(0, num_episodes, prefix=f'{self.model_type.upper()} Progress:', 
-                          suffix='Starting...', length=TRAINING['progress_bar_length'])
+                        suffix='Starting...', length=TRAINING['progress_bar_length'])
         
         for episode in range(num_episodes):
             episode_start_time = time.time()
             
-            # Reset environment with obstacles
-            obs = self.env.reset(obstacle_num=ENVIRONMENT['obstacle_num'], 
-                               layout=ENVIRONMENT['layout'], 
-                               test_phase=False, 
-                               counter=None)
+            # Check if we need to advance to the next curriculum phase
+            if use_curriculum and curriculum_phases and current_phase < len(curriculum_phases):
+                phase_episode_count += 1
+                phase_episodes = curriculum_phases[current_phase]['episodes']
+                
+                if phase_episode_count >= phase_episodes and current_phase < len(curriculum_phases) - 1:
+                    current_phase += 1
+                    phase_episode_count = 0
+                    moving_ratio = curriculum_phases[current_phase]['moving_ratio']
+                    velocity_scale = curriculum_phases[current_phase]['velocity_scale']
+                    self.logger.info(f"Advancing to Phase {current_phase+1}: " +
+                                f"Moving ratio {moving_ratio}, Velocity scale {velocity_scale}")
+            
+            # Reset environment with obstacles and current curriculum parameters
+            obs = self.env.reset(
+                obstacle_num=ENVIRONMENT['obstacle_num'], 
+                layout=ENVIRONMENT['layout'], 
+                test_phase=False, 
+                counter=None,
+                moving_obstacle_ratio=moving_ratio,
+                obstacle_velocity_scale=velocity_scale
+            )
             state = self.env.convert_coord(obs)
             reward_for_episode = 0
             num_step_per_eps = 0
@@ -388,6 +427,9 @@ class DQN:
                     self.logger.info(f"Starting learning from buffer after {steps_done} steps")
                     self.logger.info(f"Main buffer size: {len(self.replay_buffer)}")
                     self.logger.info(f"Collision buffer size: {len(self.replay_buffer_b)}")
+                    if use_curriculum:
+                        self.logger.info(f"Current curriculum phase: {current_phase+1}/{len(curriculum_phases)}")
+                        self.logger.info(f"  Moving ratio: {moving_ratio}, Velocity scale: {velocity_scale}")
                     self.first = True
                 
                 # Episode termination
@@ -414,19 +456,25 @@ class DQN:
                     avg_reward = np.mean(rewards_list[-10:]) if len(rewards_list) >= 10 else np.mean(rewards_list)
                     progress_suffix = f'Ep: {episode+1}/{num_episodes} | Reward: {reward_for_episode:.2f} | Avg: {avg_reward:.2f}'
                     print_progress_bar(episode+1, num_episodes, prefix=f'{self.model_type.upper()} Progress:',
-                                      suffix=progress_suffix, length=TRAINING['progress_bar_length'])
+                                    suffix=progress_suffix, length=TRAINING['progress_bar_length'])
                     
                     # Decide log level based on frequency
                     if episode % TRAINING['log_frequency'] == 0:
+                        curriculum_info = ""
+                        if use_curriculum:
+                            curriculum_info = f" | Phase: {current_phase+1}/{len(curriculum_phases)} " + \
+                                            f"({moving_ratio:.1f} moving, {velocity_scale:.1f} vel)"
+                        
                         self.logger.info(
                             f"Episode: {episode}/{num_episodes} | "
                             f"Reward: {reward_for_episode:.2f} | "
                             f"Status: {info} | "
-                            f"Steps: {num_step_per_eps} | "
+                            f"Steps: {num_step_per_eps}"
+                            f"{curriculum_info} | "
                             f"Time: {episode_time:.2f}s"
                         )
                     
-                    # Terminal output at specified intervals
+                    # Detailed terminal output at specified intervals
                     if episode % TRAINING['terminal_output_frequency'] == 0:
                         # Calculate statistics
                         success_rate = success_count / (episode + 1)
@@ -441,12 +489,15 @@ class DQN:
                         print(f"  Last reward: {reward_for_episode:.2f}, Avg reward: {avg_reward:.2f}")
                         print(f"  Success: {success_rate:.1%}, Collision: {collision_rate:.1%}")
                         print(f"  Epsilon: {epsilon:.4f}, Steps: {num_step_per_eps} (avg: {avg_steps:.1f})")
+                        if use_curriculum:
+                            print(f"  Curriculum: Phase {current_phase+1}/{len(curriculum_phases)}, " +
+                                f"{moving_ratio:.1f} moving ratio, {velocity_scale:.1f} velocity scale")
                         print(f"  Memory: {len(self.replay_buffer)} main, {len(self.replay_buffer_b)} collision")
                         print()
                         
                         # Redraw progress bar
                         print_progress_bar(episode+1, num_episodes, prefix=f'{self.model_type.upper()} Progress:',
-                                          suffix=progress_suffix, length=TRAINING['progress_bar_length'])
+                                        suffix=progress_suffix, length=TRAINING['progress_bar_length'])
                     
                     # Detailed logging at specified intervals
                     if episode > 0 and episode % TRAINING['detailed_log_frequency'] == 0:
@@ -458,6 +509,11 @@ class DQN:
                         collision_rate = collision_count / (episode + 1)
                         timeout_rate = timeout_count / (episode + 1)
                         
+                        curriculum_info = ""
+                        if use_curriculum:
+                            curriculum_info = f" | Phase: {current_phase+1}/{len(curriculum_phases)} " + \
+                                            f"({moving_ratio:.1f} moving, {velocity_scale:.1f} vel)"
+                        
                         self.logger.info(
                             f"Training Stats | "
                             f"Episodes: {episode+1}/{num_episodes} | "
@@ -467,6 +523,7 @@ class DQN:
                             f"Success: {success_rate:.2%} | "
                             f"Collision: {collision_rate:.2%} | "
                             f"Epsilon: {epsilon:.4f}"
+                            f"{curriculum_info}"
                         )
                     
                     # Update visualization at specified intervals
@@ -482,7 +539,7 @@ class DQN:
                         print(f"\n[CHECKPOINT] Model saved at episode {episode+1}: {path}\n")
                         # Redraw progress bar
                         print_progress_bar(episode+1, num_episodes, prefix=f'{self.model_type.upper()} Progress:',
-                                          suffix=progress_suffix, length=TRAINING['progress_bar_length'])
+                                        suffix=progress_suffix, length=TRAINING['progress_bar_length'])
                     
                     break
         
@@ -505,6 +562,10 @@ class DQN:
         print(f"Timeout rate: {timeout_rate:.2%}")
         print(f"Average reward: {np.mean(rewards_list):.2f}")
         print(f"Total steps: {steps_done}")
+        if use_curriculum:
+            print(f"Final curriculum phase: {current_phase+1}/{len(curriculum_phases)}")
+            print(f"  Moving obstacle ratio: {moving_ratio:.2f}")
+            print(f"  Obstacle velocity scale: {velocity_scale:.2f}")
         print("="*80 + "\n")
         
         self.logger.info(f"Training completed in {total_time:.2f} seconds")
@@ -512,6 +573,8 @@ class DQN:
         self.logger.info(f"Final Collision Rate: {collision_rate:.2%}")
         self.logger.info(f"Final Timeout Rate: {timeout_rate:.2%}")
         self.logger.info(f"Average Reward: {np.mean(rewards_list):.2f}")
+        if use_curriculum:
+            self.logger.info(f"Final curriculum settings: {moving_ratio:.2f} moving ratio, {velocity_scale:.2f} velocity scale")
         
         # Save final model
         final_path = os.path.join(self.model_path, f"{self.model_type}_final.pth")

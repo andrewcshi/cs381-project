@@ -1,3 +1,5 @@
+# env.py
+
 import rvo2
 import torch
 import itertools
@@ -36,11 +38,15 @@ class ObstacleEnv:
         self.radius = 0.3
         self.max_speed = 1.0
         
+        # Dynamic obstacle parameters
+        self.moving_obstacle_ratio = 0.8  # Percentage of obstacles that move
+        self.obstacle_velocity_scale = 0.3  # Scale factor for obstacle velocities
+        
         # Initialize RVO2 simulator
         params = (self.neighbor_dist, self.max_neighbors, 
-                  self.time_horizon, self.time_horizon_obst)
+                self.time_horizon, self.time_horizon_obst)
         self.sim = rvo2.PyRVOSimulator(self.time_step, *params, 
-                                       self.radius, self.max_speed)
+                                    self.radius, self.max_speed)
         
         # Pre-compute velocity samples for action space
         self.vel_samples = self.action_space()
@@ -57,7 +63,7 @@ class ObstacleEnv:
     def _circle_layout(self, obstacle_num):
         """Position obstacles in a circular pattern around the origin."""
         while len(self.obstacle_list) < obstacle_num:
-            obstacle = Obstacle(self.time_step)
+            obstacle = Obstacle(self.time_step, self.obstacle_velocity_scale)
             angle = np.random.random() * np.pi * 2
             px_noise = (np.random.random() - 0.5) * 0.5
             py_noise = (np.random.random() - 0.5) * 0.5
@@ -65,8 +71,18 @@ class ObstacleEnv:
             py = self.circle_radius * np.sin(angle) + py_noise
 
             if self._is_valid_position(px, py, obstacle):
-                # Static obstacle (zero velocity and no goal)
+                # Initialize obstacle with position and zero initial velocity
                 obstacle.set(px, py, 0, 0, 0, 0, 0)
+                
+                # For circular obstacles, set center at origin
+                if obstacle.movement_type == 'circular':
+                    obstacle.set_circular_params(0, 0)
+                    
+                # Make some obstacles stationary
+                if np.random.random() > self.moving_obstacle_ratio:
+                    obstacle.v_pref = 0
+                    obstacle.movement_type = 'static'
+                    
                 self.obstacle_list.append(obstacle)
 
     def _square_layout(self, obstacle_num):
@@ -127,7 +143,8 @@ class ObstacleEnv:
             
         return action_space
 
-    def reset(self, obstacle_num, layout="circle", test_phase=False, counter=None):
+    def reset(self, obstacle_num, layout="circle", test_phase=False, counter=None, 
+          moving_obstacle_ratio=None, obstacle_velocity_scale=None):
         """
         Reset the environment with new obstacles.
         
@@ -136,6 +153,8 @@ class ObstacleEnv:
             layout: Layout pattern for obstacles ("circle", "square", or "random")
             test_phase: Flag for reproducible testing
             counter: Seed value for reproducible testing
+            moving_obstacle_ratio: Ratio of moving obstacles (0-1)
+            obstacle_velocity_scale: Velocity scale factor for obstacles
             
         Returns:
             Initial observation state
@@ -143,6 +162,12 @@ class ObstacleEnv:
         # Initialize robot agent
         self.robot = Robot(self.time_step)
         self.obstacle_list = []
+        
+        # Update dynamic obstacle parameters if provided
+        if moving_obstacle_ratio is not None:
+            self.moving_obstacle_ratio = moving_obstacle_ratio
+        if obstacle_velocity_scale is not None:
+            self.obstacle_velocity_scale = obstacle_velocity_scale
         
         # Set seed for reproducibility if in test phase
         if test_phase and counter is not None:
@@ -156,15 +181,15 @@ class ObstacleEnv:
         
         # Initialize RVO2 simulation with obstacles
         params = (self.neighbor_dist, self.max_neighbors, 
-                  self.time_horizon, self.time_horizon_obst)
-                  
+                self.time_horizon, self.time_horizon_obst)
+                
         for obstacle in self.obstacle_list:
             self.sim.addAgent(
                 (obstacle.px, obstacle.py), 
                 *params, 
                 obstacle.radius + 0.01 + self.safety_space,
-                0.0,  # Zero preferred velocity for static obstacles
-                (0.0, 0.0)  # Zero initial velocity
+                obstacle.v_pref,  # Now using actual preferred velocity
+                (obstacle.vx, obstacle.vy)  # Initial velocity
             )
             
         # Reset simulation time and distance to goal
@@ -186,14 +211,19 @@ class ObstacleEnv:
             done: Whether episode is done
             info: Additional information
         """
-        # Static obstacles have zero preferred velocity
-        for i in range(len(self.obstacle_list)):
-            self.sim.setAgentPrefVelocity(i, (0.0, 0.0))
+        # Update preferred velocities for obstacles in RVO2 simulator
+        for i, obstacle in enumerate(self.obstacle_list):
+            if obstacle.movement_type != 'static':
+                vx, vy = obstacle.calculate_velocity()
+                self.sim.setAgentPrefVelocity(i, (vx, vy))
+            else:
+                # Static obstacles have zero preferred velocity
+                self.sim.setAgentPrefVelocity(i, (0.0, 0.0))
 
         # Advance simulation
         self.sim.doStep()
         
-        # Update obstacle positions
+        # Update obstacle positions and velocities from simulation
         for i, obstacle in enumerate(self.obstacle_list):
             obstacle.set_position(self.sim.getAgentPosition(i))
             obstacle.set_velocity(self.sim.getAgentVelocity(i))
@@ -209,7 +239,7 @@ class ObstacleEnv:
         for obstacle in self.obstacle_list:
             distance = norm(np.array(obstacle.get_position()) - np.array(self.robot.get_position())) - obstacle.radius - self.robot.radius
             distance_list.append(distance)
-            
+                
         d_min = min(distance_list) if distance_list else float('inf')
         current_dg = norm(np.array(self.robot.get_position()) - np.array(self.robot.get_goal_position()))
         reaching_goal = current_dg < self.robot.radius
@@ -236,7 +266,10 @@ class ObstacleEnv:
             done = True
             info = f"Goal reached, time {self.sim_time:.2f}"
         else:
-            reward = delta_d
+            # Add small bonus for avoiding dynamic obstacles
+            num_moving_obstacles = sum(1 for obs in self.obstacle_list if obs.v_pref > 0)
+            avoidance_bonus = 0.05 * num_moving_obstacles if num_moving_obstacles > 0 else 0
+            reward = delta_d + avoidance_bonus
             done = False
             info = "Moving"
 
