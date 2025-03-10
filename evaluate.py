@@ -6,17 +6,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 import argparse
 from env import ObstacleEnv
-from models import LSTMNetwork, TransformerNetwork
+from models import create_model
 from config import MODEL, ENVIRONMENT, PATHS
 
-# Update the Evaluator class in evaluate.py
-
 class Evaluator:
-    def __init__(self, model_path, model_type, episode):
+    def __init__(self, model_path, model_type, episode, dimension='2D'):
         self.model_path = model_path
         self.model_type = model_type
         self.episode = episode
-        self.env = ObstacleEnv()
+        self.dimension = dimension
+        self.env = ObstacleEnv(dimension=dimension)
         
         # Load the model
         self.model = self.load_model()
@@ -25,49 +24,48 @@ class Evaluator:
         os.makedirs(PATHS['eval_path'], exist_ok=True)
     
     def load_model(self):
-        """Load the trained model."""
-        # Get model parameters from config
-        robot_dim = MODEL['robot_dim']
-        obstacle_dim = MODEL['obstacle_dim']
-        num_actions = MODEL['num_actions']
+        """Load the trained model with improved file checking."""
+        # Create model using factory function
+        model = create_model(self.model_type, self.dimension)
         
-        # Create model architecture
-        if self.model_type == "lstm":
-            model = LSTMNetwork(
-                robot_dim, 
-                obstacle_dim, 
-                MODEL['lstm']['hidden_dim'], 
-                num_actions
-            )
-        elif self.model_type == "transformer":
-            model = TransformerNetwork(
-                robot_dim, 
-                obstacle_dim, 
-                MODEL['transformer']['hidden_dim'], 
-                num_actions, 
-                nhead=MODEL['transformer']['nhead'], 
-                num_layers=MODEL['transformer']['num_layers'], 
-                dropout=MODEL['transformer']['dropout']
-            )
-        else:
-            raise ValueError(f"Unknown model type: {self.model_type}")
+        # Check multiple possible model file patterns
+        possible_model_files = [
+            # Try with episode and dimension
+            os.path.join(self.model_path, f"{self.model_type}_{self.dimension}_ep_{self.episode}.pth"),
+            # Try final model with dimension
+            os.path.join(self.model_path, f"{self.model_type}_{self.dimension}_final.pth"),
+            # Try with episode but without dimension
+            os.path.join(self.model_path, f"{self.model_type}_ep_{self.episode}.pth"),
+            # Try final model without dimension
+            os.path.join(self.model_path, f"{self.model_type}_final.pth"),
+            # Try interrupted model
+            os.path.join(self.model_path, f"{self.model_type}_{self.dimension}_interrupted.pth")
+        ]
         
-        # Load weights
-        model_file = os.path.join(self.model_path, f"{self.model_type}_ep_{self.episode}.pth")
-        if os.path.exists(model_file):
-            model.load_state_dict(torch.load(model_file))
-            print(f"Loaded model from {model_file}")
-        else:
-            print(f"Model file {model_file} not found. Using untrained model.")
+        # Try to load each possible file
+        model_loaded = False
+        for model_file in possible_model_files:
+            if os.path.exists(model_file):
+                try:
+                    model.load_state_dict(torch.load(model_file))
+                    print(f"Loaded model from {model_file}")
+                    model_loaded = True
+                    break
+                except Exception as e:
+                    print(f"Error loading model from {model_file}: {e}")
+                    continue
+        
+        if not model_loaded:
+            print(f"No model file found for {self.model_type} {self.dimension}. Using untrained model.")
         
         model.eval()  # Set to evaluation mode
         return model
     
     def run_evaluation(self, num_episodes=100, render_every=25, 
-                     obstacle_num=ENVIRONMENT['obstacle_num'], 
-                     layout=ENVIRONMENT['layout'],
-                     moving_obstacle_ratio=ENVIRONMENT.get('moving_obstacle_ratio', 0.8),
-                     obstacle_velocity_scale=ENVIRONMENT.get('obstacle_velocity_scale', 0.3)):
+                 obstacle_num=ENVIRONMENT['obstacle_num'], 
+                 layout=ENVIRONMENT['layout'],
+                 moving_obstacle_ratio=ENVIRONMENT.get('moving_obstacle_ratio', 0.8),
+                 obstacle_velocity_scale=ENVIRONMENT.get('obstacle_velocity_scale', 0.3)):
         """
         Run evaluation episodes.
         
@@ -92,83 +90,105 @@ class Evaluator:
         static_results = {'success': 0, 'collision': 0, 'timeout': 0, 'episodes': 0}
         moving_results = {'success': 0, 'collision': 0, 'timeout': 0, 'episodes': 0}
         
-        for episode in range(num_episodes):
-            # Reset environment
-            obs = self.env.reset(
-                obstacle_num=obstacle_num, 
-                layout=layout, 
-                test_phase=True, 
-                counter=episode,
-                moving_obstacle_ratio=moving_obstacle_ratio,
-                obstacle_velocity_scale=obstacle_velocity_scale
-            )
-            state = self.env.convert_coord(obs)
-            
-            # Count the number of moving obstacles in this episode
-            num_moving_obstacles = sum(1 for obs in self.env.obstacle_list if obs.v_pref > 0)
-            
-            # Track whether this episode has moving obstacles
-            has_moving_obstacles = num_moving_obstacles > 0
-            if has_moving_obstacles:
-                moving_results['episodes'] += 1
-            else:
-                static_results['episodes'] += 1
-                
-            done = False
-            episode_reward = 0
-            steps = 0
-            
-            # Flag to render this episode
-            should_render = render_every > 0 and episode % render_every == 0
-            
-            while not done:
-                # Get action from model
-                with torch.no_grad():
-                    q_values = self.model(state)
-                    action_idx = torch.argmax(q_values).item()
-                
-                # Execute action
-                vel_action = self.env.vel_samples[action_idx]
-                next_obs, reward, done, info = self.env.step(vel_action)
-                next_state = self.env.convert_coord(next_obs)
-                
-                # Update variables
-                state = next_state
-                episode_reward += reward
-                steps += 1
-                
-                # Render if needed
-                if should_render and episode == render_every - 1:
-                    self.env.render()
-            
-            # Update metrics based on episode outcome
-            if info == "collision":
-                collision_rate += 1
-                if has_moving_obstacles:
-                    moving_results['collision'] += 1
-                else:
-                    static_results['collision'] += 1
-            elif info == "timeout":
-                timeout_rate += 1
-                if has_moving_obstacles:
-                    moving_results['timeout'] += 1
-                else:
-                    static_results['timeout'] += 1
-            else:  # Goal reached
-                success_rate += 1
-                path_lengths.append(steps)
-                if has_moving_obstacles:
-                    moving_results['success'] += 1
-                else:
-                    static_results['success'] += 1
-            
-            rewards.append(episode_reward)
-            
-            if episode % 10 == 0:
-                print(f"Completed episode {episode}/{num_episodes}, reward: {episode_reward:.2f}, " +
-                     f"outcome: {info}, moving obstacles: {num_moving_obstacles}/{obstacle_num}")
+        print(f"Running evaluation in {self.dimension} environment with {self.model_type} model...")
         
-        # Normalize rates
+        try:
+            for episode in range(num_episodes):
+                # Reset environment
+                obs = self.env.reset(
+                    obstacle_num=obstacle_num, 
+                    layout=layout, 
+                    test_phase=True, 
+                    counter=episode,
+                    moving_obstacle_ratio=moving_obstacle_ratio,
+                    obstacle_velocity_scale=obstacle_velocity_scale,
+                    dimension=self.dimension
+                )
+                state = self.env.convert_coord(obs)
+                
+                # Count the number of moving obstacles in this episode
+                num_moving_obstacles = sum(1 for obs in self.env.obstacle_list if obs.v_pref > 0)
+                
+                # Track whether this episode has moving obstacles
+                has_moving_obstacles = num_moving_obstacles > 0
+                if has_moving_obstacles:
+                    moving_results['episodes'] += 1
+                else:
+                    static_results['episodes'] += 1
+                    
+                done = False
+                episode_reward = 0
+                steps = 0
+                
+                # Flag to render this episode
+                should_render = render_every > 0 and episode % render_every == 0
+                
+                while not done:
+                    # Get action from model
+                    with torch.no_grad():
+                        q_values = self.model(state)
+                        action_idx = torch.argmax(q_values).item()
+                    
+                    # Execute action
+                    vel_action = self.env.vel_samples[action_idx]
+                    next_obs, reward, done, info = self.env.step(vel_action)
+                    next_state = self.env.convert_coord(next_obs)
+                    
+                    # Update variables
+                    state = next_state
+                    episode_reward += reward
+                    steps += 1
+                    
+                    # Render if needed
+                    if should_render and episode == render_every - 1:
+                        self.env.render()
+                
+                # Update metrics based on episode outcome
+                if info == "collision":
+                    collision_rate += 1
+                    if has_moving_obstacles:
+                        moving_results['collision'] += 1
+                    else:
+                        static_results['collision'] += 1
+                elif info == "timeout":
+                    timeout_rate += 1
+                    if has_moving_obstacles:
+                        moving_results['timeout'] += 1
+                    else:
+                        static_results['timeout'] += 1
+                elif "Goal reached" in info or "goal reached" in info.lower():  # Check for success in a more flexible way
+                    success_rate += 1
+                    path_lengths.append(steps)
+                    if has_moving_obstacles:
+                        moving_results['success'] += 1
+                    else:
+                        static_results['success'] += 1
+                else:
+                    # If we get here, it's an unrecognized outcome - log it
+                    print(f"Unrecognized episode outcome: '{info}'")
+                    # Default to timeout for unrecognized outcomes
+                    timeout_rate += 1
+                    if has_moving_obstacles:
+                        moving_results['timeout'] += 1
+                    else:
+                        static_results['timeout'] += 1
+                
+                rewards.append(episode_reward)
+                
+                if episode % 10 == 0:
+                    print(f"Completed episode {episode}/{num_episodes}, reward: {episode_reward:.2f}, " +
+                        f"outcome: {info}, moving obstacles: {num_moving_obstacles}/{obstacle_num}")
+        
+        except KeyboardInterrupt:
+            print("\nEvaluation interrupted by user.")
+            if not rewards:  # If we haven't completed any episodes
+                raise KeyboardInterrupt("No evaluation data collected")
+            
+            # Adjust the actual number of episodes completed
+            num_episodes = len(rewards)
+            print(f"Using data from {num_episodes} completed episodes for evaluation.")
+        
+        # Normalize rates based on actual episodes completed
         success_rate /= num_episodes
         collision_rate /= num_episodes
         timeout_rate /= num_episodes
@@ -186,6 +206,7 @@ class Evaluator:
         # Create results dictionary
         results = {
             "model_type": self.model_type,
+            "dimension": self.dimension,
             "success_rate": success_rate,
             "collision_rate": collision_rate,
             "timeout_rate": timeout_rate,
@@ -196,7 +217,8 @@ class Evaluator:
             "moving_success_rate": moving_success_rate,
             "moving_collision_rate": moving_collision_rate,
             "static_episodes": static_results['episodes'],
-            "moving_episodes": moving_results['episodes']
+            "moving_episodes": moving_results['episodes'],
+            "episodes_completed": num_episodes  # Add the actual number of episodes completed
         }
         
         return results
@@ -214,7 +236,7 @@ class Evaluator:
         
         bars = plt.bar(labels, rates, color=colors, alpha=0.8)
         plt.ylim(0, 1)
-        plt.title(f"{self.model_type.upper()} Overall Performance", fontsize=14, fontweight='bold')
+        plt.title(f"{self.model_type.upper()} {self.dimension} Overall Performance", fontsize=14, fontweight='bold')
         plt.ylabel("Rate", fontsize=12)
         
         # Add percentage labels on top of bars
@@ -261,7 +283,7 @@ class Evaluator:
         plt.subplot(223)
         plt.axis('off')
         result_text = "\n".join([
-            f"Model: {self.model_type.upper()}",
+            f"Model: {self.model_type.upper()} ({self.dimension})",
             f"Success Rate: {results['success_rate']:.2%}",
             f"Collision Rate: {results['collision_rate']:.2%}",
             f"Timeout Rate: {results['timeout_rate']:.2%}",
@@ -310,202 +332,184 @@ class Evaluator:
         ax.set_thetagrids(angles[:-1] * 180/np.pi, metrics[:-1])
         ax.set_ylim(0, 1)
         ax.grid(True)
-        ax.set_title(f"{self.model_type.upper()} Performance Profile", fontsize=14, fontweight='bold')
+        ax.set_title(f"{self.model_type.upper()} {self.dimension} Performance Profile", fontsize=14, fontweight='bold')
         
         # Add rings for reference
         ax.set_rticks([0.25, 0.5, 0.75, 1])
         ax.set_yticklabels(['0.25', '0.5', '0.75', '1.0'])
         
-        # Save figure
+        # Save figure with dimension in filename
         plt.tight_layout()
-        plt.savefig(f"{PATHS['eval_path']}/{self.model_type}_eval_results.png", dpi=150)
+        plt.savefig(f"{PATHS['eval_path']}/{self.model_type}_{self.dimension}_eval_results.png", dpi=150)
         plt.close()
 
-def compare_models(lstm_results, transformer_results):
-    """Compare and visualize results from both models."""
-    # Create bar chart comparing key metrics
+def compare_models(results_dict):
+    """
+    Compare and visualize results from different models and dimensions.
+    
+    Args:
+        results_dict: Dictionary mapping model-dimension pairs to results
+    """
+    # Setup for comparison plots
+    plt.figure(figsize=(15, 10))
+    
+    # Collect all model-dimension combinations
+    model_dims = list(results_dict.keys())
+    num_models = len(model_dims)
+    
+    # Extract metrics for comparison
     metrics = ["success_rate", "collision_rate", "static_success_rate", "moving_success_rate", "avg_reward"]
     labels = ["Overall Success", "Collision Rate", "Static Success", "Moving Success", "Avg Reward"]
     
-    plt.figure(figsize=(15, 10))
-    
     # Normalize reward for better visualization
-    max_reward = max(lstm_results["avg_reward"], transformer_results["avg_reward"])
+    max_reward = max([results_dict[md]["avg_reward"] for md in model_dims])
     
-    lstm_values = [
-        lstm_results["success_rate"],
-        lstm_results["collision_rate"],
-        lstm_results["static_success_rate"],
-        lstm_results["moving_success_rate"],
-        lstm_results["avg_reward"] / max_reward if max_reward != 0 else 0
-    ]
+    # Prepare values for plotting
+    values = []
+    for model_dim in model_dims:
+        results = results_dict[model_dim]
+        model_values = [
+            results["success_rate"],
+            results["collision_rate"],
+            results["static_success_rate"],
+            results["moving_success_rate"],
+            results["avg_reward"] / max_reward if max_reward != 0 else 0
+        ]
+        values.append(model_values)
     
-    transformer_values = [
-        transformer_results["success_rate"],
-        transformer_results["collision_rate"],
-        transformer_results["static_success_rate"],
-        transformer_results["moving_success_rate"],
-        transformer_results["avg_reward"] / max_reward if max_reward != 0 else 0
-    ]
-    
+    # Bar chart comparison
     x = np.arange(len(labels))
-    width = 0.35
+    width = 0.8 / num_models  # Adjust bar width based on number of models
     
-    plt.bar(x - width/2, lstm_values, width, label='LSTM')
-    plt.bar(x + width/2, transformer_values, width, label='Transformer')
+    # Plot bars for each model-dimension combination
+    for i, model_dim in enumerate(model_dims):
+        plt.bar(x + (i - num_models/2 + 0.5) * width, values[i], width, label=model_dim)
     
     plt.xlabel('Metrics')
-    plt.title('LSTM vs Transformer Performance Comparison (Static & Moving Obstacles)', fontsize=14, fontweight='bold')
+    plt.title('Model Performance Comparison (2D vs 3D)', fontsize=14, fontweight='bold')
     plt.xticks(x, labels)
     plt.legend()
     
     # Add actual values as text
-    for i, v in enumerate(lstm_values):
-        if metrics[i] == "avg_reward":
-            plt.text(i - width/2, v + 0.02, f"{lstm_results['avg_reward']:.2f}", ha='center')
-        else:
-            plt.text(i - width/2, v + 0.02, f"{v:.2f}", ha='center')
-    
-    for i, v in enumerate(transformer_values):
-        if metrics[i] == "avg_reward":
-            plt.text(i + width/2, v + 0.02, f"{transformer_results['avg_reward']:.2f}", ha='center')
-        else:
-            plt.text(i + width/2, v + 0.02, f"{v:.2f}", ha='center')
+    for i, model_dim in enumerate(model_dims):
+        for j, v in enumerate(values[i]):
+            if metrics[j] == "avg_reward":
+                plt.text(j + (i - num_models/2 + 0.5) * width, v + 0.02, 
+                        f"{results_dict[model_dim]['avg_reward']:.2f}", 
+                        ha='center', fontsize=8)
+            else:
+                plt.text(j + (i - num_models/2 + 0.5) * width, v + 0.02, 
+                        f"{v:.2f}", ha='center', fontsize=8)
     
     plt.tight_layout()
-    plt.savefig(f"{PATHS['eval_path']}/model_comparison.png")
-    
-    # Additional comparison chart for static vs moving obstacles
-    plt.figure(figsize=(12, 6))
-    
-    # Create grouped bar chart
-    labels = ['Static Success', 'Moving Success', 'Static Collision', 'Moving Collision']
-    lstm_values = [
-        lstm_results['static_success_rate'],
-        lstm_results['moving_success_rate'],
-        lstm_results['static_collision_rate'],
-        lstm_results['moving_collision_rate']
-    ]
-    
-    transformer_values = [
-        transformer_results['static_success_rate'],
-        transformer_results['moving_success_rate'],
-        transformer_results['static_collision_rate'],
-        transformer_results['moving_collision_rate']
-    ]
-    
-    x = np.arange(len(labels))
-    width = 0.35
-    
-    fig, ax = plt.subplots(figsize=(12, 6))
-    rects1 = ax.bar(x - width/2, lstm_values, width, label='LSTM')
-    rects2 = ax.bar(x + width/2, transformer_values, width, label='Transformer')
-    
-    ax.set_ylim(0, 1)
-    ax.set_ylabel('Rate')
-    ax.set_title('Static vs Moving Obstacle Performance Comparison', fontsize=14, fontweight='bold')
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.legend()
-    
-    # Add value labels
-    for i, v in enumerate(lstm_values):
-        ax.text(i - width/2, v + 0.02, f"{v:.2f}", ha='center')
-    
-    for i, v in enumerate(transformer_values):
-        ax.text(i + width/2, v + 0.02, f"{v:.2f}", ha='center')
-    
-    plt.tight_layout()
-    plt.savefig(f"{PATHS['eval_path']}/static_vs_moving_comparison.png")
+    plt.savefig(f"{PATHS['eval_path']}/model_dimension_comparison.png")
     
     # Print comparison results
-    print("\nModel Comparison:")
-    print("-" * 50)
-    print(f"LSTM Overall Success Rate: {lstm_results['success_rate']:.2%}")
-    print(f"Transformer Overall Success Rate: {transformer_results['success_rate']:.2%}")
-    print()
-    print(f"LSTM Static Success Rate: {lstm_results['static_success_rate']:.2%}")
-    print(f"Transformer Static Success Rate: {transformer_results['static_success_rate']:.2%}")
-    print()
-    print(f"LSTM Moving Success Rate: {lstm_results['moving_success_rate']:.2%}")
-    print(f"Transformer Moving Success Rate: {transformer_results['moving_success_rate']:.2%}")
-    print()
-    print(f"LSTM Collision Rate: {lstm_results['collision_rate']:.2%}")
-    print(f"Transformer Collision Rate: {transformer_results['collision_rate']:.2%}")
-    print()
-    print(f"LSTM Average Reward: {lstm_results['avg_reward']:.2f}")
-    print(f"Transformer Average Reward: {transformer_results['avg_reward']:.2f}")
-    print("-" * 50)
+    print("\nModel-Dimension Comparison:")
+    print("-" * 70)
     
-    # Determine overall winner
-    lstm_score = lstm_results["success_rate"] - lstm_results["collision_rate"] + lstm_results["avg_reward"] / max_reward
-    transformer_score = transformer_results["success_rate"] - transformer_results["collision_rate"] + transformer_results["avg_reward"] / max_reward
+    # Table headers
+    header = "| {:^20} | {:^10} | {:^10} | {:^10} | {:^10} |".format(
+        "Model-Dimension", "Success", "Collision", "Static Succ", "Moving Succ")
+    print(header)
+    print("-" * 70)
     
-    # Determine static scenario winner
-    lstm_static_score = lstm_results["static_success_rate"] - lstm_results["static_collision_rate"]
-    transformer_static_score = transformer_results["static_success_rate"] - transformer_results["static_collision_rate"]
+    # Table rows
+    for model_dim in model_dims:
+        results = results_dict[model_dim]
+        row = "| {:^20} | {:^10.2%} | {:^10.2%} | {:^10.2%} | {:^10.2%} |".format(
+            model_dim,
+            results["success_rate"],
+            results["collision_rate"],
+            results["static_success_rate"],
+            results["moving_success_rate"]
+        )
+        print(row)
     
-    # Determine moving scenario winner
-    lstm_moving_score = lstm_results["moving_success_rate"] - lstm_results["moving_collision_rate"]
-    transformer_moving_score = transformer_results["moving_success_rate"] - transformer_results["moving_collision_rate"]
+    print("-" * 70)
+    print("\nDetailed Analysis:")
     
-    print("\nPerformance Analysis:")
-    print("-" * 50)
+    # Compare 2D vs 3D for each model type
+    model_types = set([md.split('-')[0] for md in model_dims])
+    for model in model_types:
+        if f"{model}-2D" in results_dict and f"{model}-3D" in results_dict:
+            r2d = results_dict[f"{model}-2D"]
+            r3d = results_dict[f"{model}-3D"]
+            
+            print(f"\n{model.upper()} 2D vs 3D:")
+            print(f"  Success: 2D={r2d['success_rate']:.2%}, 3D={r3d['success_rate']:.2%}, " +
+                 f"Diff={r3d['success_rate']-r2d['success_rate']:.2%}")
+            print(f"  Collision: 2D={r2d['collision_rate']:.2%}, 3D={r3d['collision_rate']:.2%}, " +
+                 f"Diff={r3d['collision_rate']-r2d['collision_rate']:.2%}")
+            print(f"  Moving Success: 2D={r2d['moving_success_rate']:.2%}, 3D={r3d['moving_success_rate']:.2%}, " +
+                 f"Diff={r3d['moving_success_rate']-r2d['moving_success_rate']:.2%}")
     
-    # Overall comparison
-    if lstm_score > transformer_score:
-        diff = (lstm_score - transformer_score) / transformer_score * 100 if transformer_score != 0 else float('inf')
-        print(f"LSTM outperforms Transformer overall by approximately {diff:.2f}%")
-    elif transformer_score > lstm_score:
-        diff = (transformer_score - lstm_score) / lstm_score * 100 if lstm_score != 0 else float('inf')
-        print(f"Transformer outperforms LSTM overall by approximately {diff:.2f}%")
-    else:
-        print("Both models perform similarly overall")
+    # Compare LSTM vs Transformer for each dimension
+    for dim in ["2D", "3D"]:
+        if f"lstm-{dim}" in results_dict and f"transformer-{dim}" in results_dict:
+            rl = results_dict[f"lstm-{dim}"]
+            rt = results_dict[f"transformer-{dim}"]
+            
+            print(f"\nLSTM vs Transformer in {dim}:")
+            print(f"  Success: LSTM={rl['success_rate']:.2%}, Transformer={rt['success_rate']:.2%}, " +
+                 f"Diff={rt['success_rate']-rl['success_rate']:.2%}")
+            print(f"  Collision: LSTM={rl['collision_rate']:.2%}, Transformer={rt['collision_rate']:.2%}, " +
+                 f"Diff={rt['collision_rate']-rl['collision_rate']:.2%}")
+            print(f"  Moving Success: LSTM={rl['moving_success_rate']:.2%}, Transformer={rt['moving_success_rate']:.2%}, " +
+                 f"Diff={rt['moving_success_rate']-rl['moving_success_rate']:.2%}")
     
-    # Static scenario comparison
-    if lstm_static_score > transformer_static_score:
-        print(f"LSTM performs better with static obstacles")
-    elif transformer_static_score > lstm_static_score:
-        print(f"Transformer performs better with static obstacles")
-    else:
-        print("Both models perform similarly with static obstacles")
-    
-    # Moving scenario comparison
-    if lstm_moving_score > transformer_moving_score:
-        print(f"LSTM performs better with moving obstacles")
-    elif transformer_moving_score > lstm_moving_score:
-        print(f"Transformer performs better with moving obstacles")
-    else:
-        print("Both models perform similarly with moving obstacles")
-    
-    print("-" * 50)
+    print("-" * 70)
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate trained models')
     parser.add_argument('--lstm-episode', type=int, default=499, help='LSTM model episode to evaluate')
     parser.add_argument('--transformer-episode', type=int, default=499, help='Transformer model episode to evaluate')
-    parser.add_argument('--eval-episodes', type=int, default=100, help='Number of evaluation episodes')
+    parser.add_argument('--eval-episodes', type=int, default=200, help='Number of evaluation episodes')
     parser.add_argument('--render-every', type=int, default=0, help='Render every N episodes (0 to disable)')
+    parser.add_argument('--dimension', type=str, choices=['2D', '3D', 'both'], default='both', 
+                      help='Dimension to evaluate (2D, 3D, or both)')
     args = parser.parse_args()
     
     # Paths
     lstm_path = f"{PATHS['base_model_path']}/lstm/"
     transformer_path = f"{PATHS['base_model_path']}/transformer/"
     
-    # Evaluate LSTM model
-    print("\nEvaluating LSTM model...")
-    lstm_evaluator = Evaluator(lstm_path, "lstm", args.lstm_episode)
-    lstm_results = lstm_evaluator.run_evaluation(args.eval_episodes, args.render_every)
-    lstm_evaluator.plot_results(lstm_results)
+    # Dimensions to evaluate
+    dimensions = ['2D', '3D'] if args.dimension == 'both' else [args.dimension]
     
-    # Evaluate Transformer model
-    print("\nEvaluating Transformer model...")
-    transformer_evaluator = Evaluator(transformer_path, "transformer", args.transformer_episode)
-    transformer_results = transformer_evaluator.run_evaluation(args.eval_episodes, args.render_every)
-    transformer_evaluator.plot_results(transformer_results)
+    # Store results for comparison
+    all_results = {}
     
-    # Compare models
-    compare_models(lstm_results, transformer_results)
+    # Run evaluations for each model and dimension
+    for dimension in dimensions:
+        try:
+            # Evaluate LSTM model
+            print(f"\nEvaluating LSTM model in {dimension} environment...")
+            lstm_evaluator = Evaluator(lstm_path, "lstm", args.lstm_episode, dimension)
+            lstm_results = lstm_evaluator.run_evaluation(args.eval_episodes, args.render_every)
+            lstm_evaluator.plot_results(lstm_results)
+            all_results[f"lstm-{dimension}"] = lstm_results
+            
+            # Evaluate Transformer model
+            print(f"\nEvaluating Transformer model in {dimension} environment...")
+            transformer_evaluator = Evaluator(transformer_path, "transformer", args.transformer_episode, dimension)
+            transformer_results = transformer_evaluator.run_evaluation(args.eval_episodes, args.render_every)
+            transformer_evaluator.plot_results(transformer_results)
+            all_results[f"transformer-{dimension}"] = transformer_results
+        except KeyboardInterrupt:
+            print(f"\nEvaluation interrupted for {dimension} environment.")
+            # Continue with the next dimension if available
+            continue
+        except Exception as e:
+            print(f"\nError evaluating models in {dimension} environment: {str(e)}")
+            continue
+    
+    # Compare all models and dimensions
+    if len(all_results) > 1:
+        try:
+            compare_models(all_results)
+        except Exception as e:
+            print(f"Error comparing models: {str(e)}")
 
 if __name__ == "__main__":
     main()

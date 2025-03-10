@@ -188,7 +188,8 @@ def plot_stats(frame_idx, rewards, losses, step, model_type):
     plt.close()
 
 class DQN:
-    def __init__(self, model_path, env, model_type, logger=None):
+    def __init__(self, model_path, env, model_type, logger=None, 
+                 robot_dim=None, obstacle_dim=None, num_actions=None, hidden_dim=None, model=None):
         self.env = env
         self.model_path = model_path
         self.model_type = model_type
@@ -208,14 +209,14 @@ class DQN:
         self.replay_buffer = deque(maxlen=memory_size)
         self.replay_buffer_b = deque(maxlen=memory_size)  # Buffer for collision experiences
         
-        # Model dimensions from config
-        self.num_actions = MODEL['num_actions']
-        self.robot_dim = MODEL['robot_dim']
-        self.obstacle_dim = MODEL['obstacle_dim']
-        self.hidden_dim = MODEL['hidden_dim']
+        # Model dimensions from config or parameters
+        self.num_actions = num_actions or MODEL['num_actions']
+        self.robot_dim = robot_dim or MODEL['robot_dim']
+        self.obstacle_dim = obstacle_dim or MODEL['obstacle_dim']
+        self.hidden_dim = hidden_dim or MODEL['hidden_dim']
         
-        # Create model based on specified type
-        self.model = self.make_model()
+        # Use provided model or create model based on specified type
+        self.model = model if model is not None else self.make_model()
         self.first = False  # Flag to indicate when training begins
         
         # Create output directories if they don't exist
@@ -223,6 +224,9 @@ class DQN:
         os.makedirs(PATHS['figures_path'], exist_ok=True)
         
         self.logger.info(f"Initialized {model_type.upper()} model with {self.get_param_count():,} parameters")
+        if hasattr(self.env, 'dimension'):
+            self.logger.info(f"Environment dimension: {self.env.dimension}")
+            self.logger.info(f"Robot dimension: {self.robot_dim}, Obstacle dimension: {self.obstacle_dim}, Actions: {self.num_actions}")
 
     def get_param_count(self):
         """Count the number of parameters in the model."""
@@ -230,28 +234,63 @@ class DQN:
         
     def make_model(self):
         """Create the appropriate model based on model_type."""
+        # Check if environment has a dimension attribute (for 2D/3D)
+        dimension = getattr(self.env, 'dimension', '2D')
+        
         if self.model_type == "lstm":
-            model = LSTMNetwork(
-                self.robot_dim, 
-                self.obstacle_dim, 
-                MODEL['lstm']['hidden_dim'], 
-                self.num_actions
-            )
+            if dimension == '3D':
+                # Use 3D dimensions
+                model = LSTMNetwork(
+                    MODEL['robot_dim_3d'], 
+                    MODEL['obstacle_dim_3d'], 
+                    MODEL['lstm']['hidden_dim'], 
+                    MODEL['num_actions_3d']
+                )
+                # Update instance variables
+                self.robot_dim = MODEL['robot_dim_3d']
+                self.obstacle_dim = MODEL['obstacle_dim_3d']
+                self.num_actions = MODEL['num_actions_3d']
+            else:
+                # Use 2D dimensions
+                model = LSTMNetwork(
+                    self.robot_dim, 
+                    self.obstacle_dim, 
+                    MODEL['lstm']['hidden_dim'], 
+                    self.num_actions
+                )
         elif self.model_type == "transformer":
-            model = TransformerNetwork(
-                self.robot_dim, 
-                self.obstacle_dim, 
-                MODEL['transformer']['hidden_dim'], 
-                self.num_actions,
-                nhead=MODEL['transformer']['nhead'],
-                num_layers=MODEL['transformer']['num_layers'],
-                dropout=MODEL['transformer']['dropout']
-            )
+            if dimension == '3D':
+                # Use 3D dimensions
+                model = TransformerNetwork(
+                    MODEL['robot_dim_3d'], 
+                    MODEL['obstacle_dim_3d'], 
+                    MODEL['transformer']['hidden_dim'], 
+                    MODEL['num_actions_3d'],
+                    nhead=MODEL['transformer']['nhead'],
+                    num_layers=MODEL['transformer']['num_layers'],
+                    dropout=MODEL['transformer']['dropout']
+                )
+                # Update instance variables
+                self.robot_dim = MODEL['robot_dim_3d']
+                self.obstacle_dim = MODEL['obstacle_dim_3d']
+                self.num_actions = MODEL['num_actions_3d']
+            else:
+                # Use 2D dimensions
+                model = TransformerNetwork(
+                    self.robot_dim, 
+                    self.obstacle_dim, 
+                    MODEL['transformer']['hidden_dim'], 
+                    self.num_actions,
+                    nhead=MODEL['transformer']['nhead'],
+                    num_layers=MODEL['transformer']['num_layers'],
+                    dropout=MODEL['transformer']['dropout']
+                )
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
             
         return model
 
+    # Rest of the DQN class methods remain the same
     def agent_policy(self, state, epsilon):
         """Epsilon-greedy policy for action selection."""
         if np.random.rand() < epsilon:

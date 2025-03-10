@@ -138,3 +138,51 @@ class TransformerNetwork(BaseNetwork):
         pooled = self.pooling(transformer_output.transpose(1, 2)).squeeze(2)
         
         return pooled
+
+# Factory function to create model based on dimension ('2D' or '3D')
+def create_model(model_type, dimension='2D'):
+    """
+    Create a model of the specified type for the given dimension.
+    
+    Args:
+        model_type: Type of model ('lstm' or 'transformer')
+        dimension: Environment dimension ('2D' or '3D')
+        
+    Returns:
+        Instantiated model of the specified type
+    """
+    # Set dimensions based on environment type
+    if dimension == '3D':
+        robot_dim = MODEL['robot_dim_3d']
+        obstacle_dim = MODEL['obstacle_dim_3d']
+        num_actions = MODEL['num_actions_3d']
+    else:
+        robot_dim = MODEL['robot_dim']
+        obstacle_dim = MODEL['obstacle_dim']
+        num_actions = MODEL['num_actions']
+    
+    print(f"Creating {model_type} model for {dimension} environment:")
+    print(f"  Robot dim: {robot_dim}, Obstacle dim: {obstacle_dim}, Actions: {num_actions}")
+    
+    # Create appropriate model
+    if model_type == "lstm":
+        model = LSTMNetwork(
+            robot_dim, 
+            obstacle_dim, 
+            MODEL['lstm']['hidden_dim'], 
+            num_actions
+        )
+    elif model_type == "transformer":
+        model = TransformerNetwork(
+            robot_dim, 
+            obstacle_dim, 
+            MODEL['transformer']['hidden_dim'], 
+            num_actions,
+            nhead=MODEL['transformer']['nhead'],
+            num_layers=MODEL['transformer']['num_layers'],
+            dropout=MODEL['transformer']['dropout']
+        )
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+    
+    return model
